@@ -23,12 +23,20 @@ jobs:
       - name: Install dependencies
         run: pip install encord google-cloud-bigquery
 
-      - name: Write Encord SSH key to disk
+      - name: Write Encord EMEA SSH key to disk
         run: |
           printf '%s\n' "$ENCORD_SSH_KEY" > /tmp/encord_key
           chmod 600 /tmp/encord_key
         env:
           ENCORD_SSH_KEY: ${{ secrets.ENCORD_SSH_KEY }}
+
+      - name: Write Encord US SSH key to disk (if set)
+        if: ${{ secrets.ENCORD_US_SSH_KEY != '' }}
+        run: |
+          printf '%s\n' "$ENCORD_US_SSH_KEY" > /tmp/encord_us_key
+          chmod 600 /tmp/encord_us_key
+        env:
+          ENCORD_US_SSH_KEY: ${{ secrets.ENCORD_US_SSH_KEY }}
 
       - name: Write GCP service account key to disk
         run: printf '%s' "$GCP_SA_KEY" > /tmp/gcp-key.json
@@ -40,6 +48,8 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
           ENCORD_SSH_KEY_PATH: /tmp/encord_key
           ENCORD_DOMAIN: https://api.encord.com
+          ENCORD_US_SSH_KEY_PATH: /tmp/encord_us_key
+          ENCORD_US_DOMAIN: https://api.us.encord.com
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
         run: python sync/encord_to_bigquery.py

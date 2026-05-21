@@ -67,12 +67,17 @@ log = logging.getLogger("encord_bq")
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-SSH_KEY_PATH  = os.environ["ENCORD_SSH_KEY_PATH"]
-ENCORD_DOMAIN = os.environ.get("ENCORD_DOMAIN", "https://api.encord.com")
-GCP_PROJECT   = os.environ["GCP_PROJECT"]
-BQ_DATASET    = os.environ["BQ_DATASET"]
-MAX_WORKERS   = int(os.environ.get("MAX_WORKERS", "5"))
-BACKFILL_FROM = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)  # floor for history
+SSH_KEY_PATH     = os.environ["ENCORD_SSH_KEY_PATH"]
+ENCORD_DOMAIN    = os.environ.get("ENCORD_DOMAIN", "https://api.encord.com")
+
+# Optional US endpoint (different SSH key + domain)
+US_SSH_KEY_PATH  = os.environ.get("ENCORD_US_SSH_KEY_PATH", "")   # set if you have US projects
+US_DOMAIN        = os.environ.get("ENCORD_US_DOMAIN", "https://api.us.encord.com")
+
+GCP_PROJECT      = os.environ["GCP_PROJECT"]
+BQ_DATASET       = os.environ["BQ_DATASET"]
+MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", "5"))
+BACKFILL_FROM    = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)  # floor for history
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLIENT WORKSPACE MAPPING
@@ -486,14 +491,39 @@ def main() -> None:
     print("═" * 65)
     print(f"  Encord → BigQuery Sync  |  {today_str}")
     print(f"  Dataset     : {GCP_PROJECT}.{BQ_DATASET}")
-    print(f"  Domain      : {ENCORD_DOMAIN}")
+    print(f"  EMEA domain : {ENCORD_DOMAIN}")
+    if US_SSH_KEY_PATH:
+        print(f"  US domain   : {US_DOMAIN}")
     print("═" * 65)
 
-    # ── Connect ──
-    user_client = EncordUserClient.create_with_ssh_private_key(
-        ssh_private_key_path=SSH_KEY_PATH,
-        domain=ENCORD_DOMAIN,
-    )
+    # ── Connect to Encord (EMEA) ──
+    clients = []
+    try:
+        emea_client = EncordUserClient.create_with_ssh_private_key(
+            ssh_private_key_path=SSH_KEY_PATH,
+            domain=ENCORD_DOMAIN,
+        )
+        clients.append((emea_client, "EMEA"))
+        log.info("Connected to EMEA endpoint.")
+    except Exception as e:
+        log.error("Failed to connect to EMEA endpoint: %s", e)
+
+    # ── Connect to Encord (US) if key provided ──
+    if US_SSH_KEY_PATH:
+        try:
+            us_client = EncordUserClient.create_with_ssh_private_key(
+                ssh_private_key_path=US_SSH_KEY_PATH,
+                domain=US_DOMAIN,
+            )
+            clients.append((us_client, "US"))
+            log.info("Connected to US endpoint.")
+        except Exception as e:
+            log.warning("Failed to connect to US endpoint (skipping US projects): %s", e)
+
+    if not clients:
+        log.error("No Encord clients available. Exiting.")
+        return
+
     bq = bigquery.Client(project=GCP_PROJECT)
 
     # ── Ensure tables exist ──
@@ -502,15 +532,34 @@ def main() -> None:
     # ── Load incremental sync state ──
     sync_state = load_sync_state(bq)
 
-    # ── Discover all projects ──
-    log.info("Fetching project list...")
-    all_projects = list(user_client.list_projects(include_org_access=True))
-    log.info("Found %d projects total.", len(all_projects))
+    # ── Discover all projects from all endpoints ──
+    all_projects_with_endpoint: list[tuple] = []   # (project, endpoint_label)
+    for client, endpoint_label in clients:
+        try:
+            log.info("Fetching project list from %s...", endpoint_label)
+            endpoint_projects = list(client.list_projects(include_org_access=True))
+            log.info("  %s: %d projects found.", endpoint_label, len(endpoint_projects))
+            all_projects_with_endpoint.extend(
+                (p, endpoint_label) for p in endpoint_projects
+            )
+        except Exception as e:
+            log.error("Failed to list projects from %s: %s", endpoint_label, e)
+
+    # Deduplicate by project_hash (same project can appear on both endpoints)
+    seen_hashes = set()
+    unique_projects = []
+    for p, label in all_projects_with_endpoint:
+        ph = str(p.project_hash)
+        if ph not in seen_hashes:
+            seen_hashes.add(ph)
+            unique_projects.append((p, label))
+
+    log.info("Total unique projects: %d", len(unique_projects))
 
     # ── Determine which need syncing ──
-    to_sync = []
+    to_sync = []    # list of (project, endpoint_label)
     skipped = 0
-    for project in all_projects:
+    for project, endpoint_label in unique_projects:
         ph = str(project.project_hash)
         stored = sync_state.get(ph)
         proj_last_edited = getattr(project, "last_edited_at", None)
@@ -522,7 +571,7 @@ def main() -> None:
                 skipped += 1
                 continue   # unchanged — skip
 
-        to_sync.append(project)
+        to_sync.append((project, endpoint_label))
 
     log.info("To sync: %d | Skipped (unchanged): %d", len(to_sync), skipped)
 
@@ -537,12 +586,12 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
-            executor.submit(extract_project, p, now): p
-            for p in to_sync
+            executor.submit(extract_project, p, now): (p, label)
+            for p, label in to_sync
         }
 
         for future in as_completed(future_map):
-            project = future_map[future]
+            project, endpoint_label = future_map[future]
             ph = str(project.project_hash)
             try:
                 data = future.result()
