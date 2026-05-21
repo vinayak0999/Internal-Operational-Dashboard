@@ -40,7 +40,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
           ENCORD_SSH_KEY_PATH: /tmp/encord_key
           ENCORD_DOMAIN: https://api.encord.com
-          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          BQ_DATASET: ${{ vars.BQ_DATASET }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          BQ_DATASET: ${{ secrets.BQ_DATASET }}
           DAYS_BACK: "30"
         run: python sync/encord_to_bigquery.py
