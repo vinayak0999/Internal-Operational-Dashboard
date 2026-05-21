@@ -1,39 +1,41 @@
-name: Multi-Client Encord → BigQuery
+name: Encord → BigQuery Sync
 
 on:
   schedule:
-    - cron: "0 1 * * *"    # 6:30 AM IST daily (01:00 UTC)
-  workflow_dispatch:         # manual trigger anytime
+    - cron: "0 1 * * *"    # Runs daily at 6:30 AM IST (01:00 UTC)
+  workflow_dispatch:         # Also allows manual trigger from GitHub Actions tab
 
 jobs:
   sync:
-    name: Sync All Clients → BigQuery
+    name: Sync Encord → BigQuery
     runs-on: ubuntu-latest
-    timeout-minutes: 120     # 1731 projects takes ~90 min
+    timeout-minutes: 180     # 1731 projects takes ~90 min
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: pip install encord google-cloud-bigquery
 
-      - name: Write Encord SSH key (Accelerate admin key)
+      - name: Write Encord SSH key to disk
         run: |
           printf '%s\n' "$ENCORD_SSH_KEY" > /tmp/encord_key
           chmod 600 /tmp/encord_key
         env:
           ENCORD_SSH_KEY: ${{ secrets.ENCORD_SSH_KEY }}
 
-      - name: Write GCP service account key
+      - name: Write GCP service account key to disk
         run: printf '%s' "$GCP_SA_KEY" > /tmp/gcp-key.json
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Run multi-client sync
+      - name: Run sync
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
           ENCORD_SSH_KEY_PATH: /tmp/encord_key
@@ -41,4 +43,4 @@ jobs:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           BQ_DATASET: ${{ vars.BQ_DATASET }}
           DAYS_BACK: "30"
-        run: python multi_client_sync.py
+        run: python sync/encord_to_bigquery.py
