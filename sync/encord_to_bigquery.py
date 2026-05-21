@@ -71,7 +71,14 @@ SSH_KEY_PATH     = os.environ["ENCORD_SSH_KEY_PATH"]
 ENCORD_DOMAIN    = os.environ.get("ENCORD_DOMAIN", "https://api.encord.com")
 
 # Optional US endpoint (different SSH key + domain)
-US_SSH_KEY_PATH  = os.environ.get("ENCORD_US_SSH_KEY_PATH", "")   # set if you have US projects
+# File is always written by CI but may be empty if secret is not set — check content
+_us_key_path_raw = os.environ.get("ENCORD_US_SSH_KEY_PATH", "")
+def _key_file_has_content(path: str) -> bool:
+    try:
+        return bool(path and os.path.exists(path) and open(path).read().strip())
+    except Exception:
+        return False
+US_SSH_KEY_PATH  = _us_key_path_raw if _key_file_has_content(_us_key_path_raw) else ""
 US_DOMAIN        = os.environ.get("ENCORD_US_DOMAIN", "https://api.us.encord.com")
 
 GCP_PROJECT      = os.environ["GCP_PROJECT"]

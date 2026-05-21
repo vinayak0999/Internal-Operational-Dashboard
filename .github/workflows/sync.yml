@@ -31,7 +31,6 @@ jobs:
           ENCORD_SSH_KEY: ${{ secrets.ENCORD_SSH_KEY }}
 
       - name: Write Encord US SSH key to disk (if set)
-        if: ${{ secrets.ENCORD_US_SSH_KEY != '' }}
         run: |
           printf '%s\n' "$ENCORD_US_SSH_KEY" > /tmp/encord_us_key
           chmod 600 /tmp/encord_us_key
