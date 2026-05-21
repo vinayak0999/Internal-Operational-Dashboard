@@ -1,0 +1,16 @@
+{
+  "clients": [
+    {
+      "id": "mpcl",
+      "name": "MPCL",
+      "projects": [
+        {
+          "hash": "2a813775-341b-4408-954d-83f7dab3e840",
+          "name": "CTC Lung Nodules Phase 1",
+          "modality": "CT"
+        }
+      ]
+    }
+  ],
+  "_comment": "Add more clients and projects here. Run 'python list_projects.py' to see all available projects."
+}

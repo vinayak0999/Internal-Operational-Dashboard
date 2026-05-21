@@ -1,0 +1,8 @@
+encord
+fastapi
+uvicorn
+encord
+python-dotenv
+sqlalchemy
+numpy
+APScheduler>=3.10
