@@ -1,535 +1,596 @@
 """
-Encord → BigQuery Sync
-======================
-SSH Key → Fetch all projects (all 75 client workspaces) → Push to BigQuery
-Looker Studio reads from BigQuery tables.
+Encord → BigQuery Sync Pipeline
+=================================
+Based on the verified reference ingestion script from Encord SDK docs.
 
-BigQuery Tables Created:
-  project_health    — one row per project per day (health, progress, rejection rate)
-  annotator_stats   — one row per annotator per project per day (all flags)
-  reviewer_stats    — one row per reviewer per project per day
+Architecture:
+    list_projects(include_org_access=True)
+        → incremental check via last_edited_at
+        → for changed projects only:
+            - task_snapshot    (from workflow.stages.get_tasks())
+            - time_spent       (from project.list_time_spent())
+            - task_actions     (from project.get_task_actions())
+        → write to BigQuery (5 tables)
 
-GitHub Actions Secrets required:
-  ENCORD_SSH_KEY   — Accelerate admin private key (covers all workspaces)
-  GCP_SA_KEY       — GCP service account JSON
+BigQuery Tables:
+    encord_dashboard.projects           - one row per project (upserted)
+    encord_dashboard.workflow_stages    - stages per project (upserted)
+    encord_dashboard.tasks_snapshot     - current task state (replaced per project)
+    encord_dashboard.time_spent         - time entries (append, deduped by MERGE)
+    encord_dashboard.task_actions       - action log (append, deduped by MERGE)
 
-GitHub Actions Variables required:
-  GCP_PROJECT      — GCP project ID  (e.g. my-gcp-project)
-  BQ_DATASET       — BigQuery dataset (e.g. encord_dashboard)
+Usage:
+    python sync/encord_to_bigquery.py
+
+Environment variables (set via GitHub Actions secrets):
+    ENCORD_SSH_KEY_PATH         Path to SSH private key file
+    ENCORD_DOMAIN               https://api.encord.com (or US endpoint)
+    GOOGLE_APPLICATION_CREDENTIALS  Path to GCP service account JSON
+    GCP_PROJECT                 GCP project ID (e.g. autonex-488609)
+    BQ_DATASET                  BigQuery dataset (e.g. encord_dashboard)
 """
 
+from __future__ import annotations
+
+import datetime as dt
+import logging
 import os
 import re
-import datetime as dt
-import traceback
-from collections import defaultdict
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from typing import Iterator, List, Optional
 
-from encord import EncordUserClient
+from encord import EncordUserClient, Project
+from encord.orm.analytics import TaskActionType
+from encord.workflow import (
+    AnnotationStage,
+    ConsensusAnnotationStage,
+    ConsensusReviewStage,
+    FinalStage,
+    ReviewStage,
+)
+
 from google.cloud import bigquery
+from google.cloud.bigquery import SchemaField
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-GCP_PROJECT = os.environ["GCP_PROJECT"]
-BQ_DATASET  = os.environ.get("BQ_DATASET", "encord_dashboard")
-DAYS_BACK   = int(os.environ.get("DAYS_BACK", "30"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("encord_bq")
 
-TABLE_PROJECT   = f"{GCP_PROJECT}.{BQ_DATASET}.project_health"
-TABLE_ANNOTATOR = f"{GCP_PROJECT}.{BQ_DATASET}.annotator_stats"
-TABLE_REVIEWER  = f"{GCP_PROJECT}.{BQ_DATASET}.reviewer_stats"
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── BigQuery Schemas ─────────────────────────────────────────────────────────
-SCHEMA_PROJECT = [
-    bigquery.SchemaField("snapshot_date",          "DATE"),
-    bigquery.SchemaField("client_workspace",        "STRING"),   # ← Looker dropdown
-    bigquery.SchemaField("project_hash",            "STRING"),
-    bigquery.SchemaField("project_title",           "STRING"),
-    bigquery.SchemaField("creator_email",           "STRING",  mode="NULLABLE"),
-    bigquery.SchemaField("total_tasks",             "INTEGER"),
-    bigquery.SchemaField("tasks_complete",          "INTEGER"),
-    bigquery.SchemaField("tasks_in_review",         "INTEGER"),
-    bigquery.SchemaField("tasks_in_annotation",     "INTEGER"),
-    bigquery.SchemaField("progress_pct",            "FLOAT"),
-    bigquery.SchemaField("project_rejection_rate",  "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("total_approved",          "INTEGER"),
-    bigquery.SchemaField("total_rejected",          "INTEGER"),
-    bigquery.SchemaField("active_annotators",       "INTEGER"),
-    bigquery.SchemaField("active_reviewers",        "INTEGER"),
-    bigquery.SchemaField("total_annotation_secs",   "FLOAT"),
-    bigquery.SchemaField("total_review_secs",       "FLOAT"),
-    bigquery.SchemaField("avg_tpt_secs",            "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("health_status",           "STRING"),  # Healthy / Warning / Critical
-    bigquery.SchemaField("critical_flags",          "INTEGER"),
-    bigquery.SchemaField("warning_flags",           "INTEGER"),
-]
+SSH_KEY_PATH  = os.environ["ENCORD_SSH_KEY_PATH"]
+ENCORD_DOMAIN = os.environ.get("ENCORD_DOMAIN", "https://api.encord.com")
+GCP_PROJECT   = os.environ["GCP_PROJECT"]
+BQ_DATASET    = os.environ["BQ_DATASET"]
+MAX_WORKERS   = int(os.environ.get("MAX_WORKERS", "5"))
+BACKFILL_FROM = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)  # floor for history
 
-SCHEMA_ANNOTATOR = [
-    bigquery.SchemaField("snapshot_date",          "DATE"),
-    bigquery.SchemaField("client_workspace",        "STRING"),
-    bigquery.SchemaField("project_hash",            "STRING"),
-    bigquery.SchemaField("project_title",           "STRING"),
-    bigquery.SchemaField("annotator_email",         "STRING"),
-    bigquery.SchemaField("role",                    "STRING"),  # Annotator / Reviewer / Both
-    bigquery.SchemaField("tasks_annotated",         "INTEGER"),
-    bigquery.SchemaField("tasks_submitted",         "INTEGER"),
-    bigquery.SchemaField("tasks_approved",          "INTEGER"),
-    bigquery.SchemaField("tasks_rejected",          "INTEGER"),
-    bigquery.SchemaField("rejection_rate",          "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("annotation_time_secs",    "FLOAT"),
-    bigquery.SchemaField("avg_tpt_secs",            "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("days_active",             "INTEGER", mode="NULLABLE"),
-    bigquery.SchemaField("throughput_per_day",      "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("flag_high_rejection",     "BOOLEAN"),
-    bigquery.SchemaField("flag_too_fast",           "BOOLEAN"),
-    bigquery.SchemaField("flag_too_slow",           "BOOLEAN"),
-    bigquery.SchemaField("flag_low_throughput",     "BOOLEAN"),
-    bigquery.SchemaField("health_status",           "STRING"),  # good / warn / crit
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# CLIENT WORKSPACE MAPPING
+# Derive client name from creator_email using guest+<name>@encord.com pattern.
+# Falls back to "unknown" if pattern doesn't match.
+# ─────────────────────────────────────────────────────────────────────────────
 
-SCHEMA_REVIEWER = [
-    bigquery.SchemaField("snapshot_date",          "DATE"),
-    bigquery.SchemaField("client_workspace",        "STRING"),
-    bigquery.SchemaField("project_hash",            "STRING"),
-    bigquery.SchemaField("project_title",           "STRING"),
-    bigquery.SchemaField("reviewer_email",          "STRING"),
-    bigquery.SchemaField("tasks_reviewed",          "INTEGER"),
-    bigquery.SchemaField("tasks_approved",          "INTEGER"),
-    bigquery.SchemaField("tasks_rejected",          "INTEGER"),
-    bigquery.SchemaField("rejection_rate",          "FLOAT",   mode="NULLABLE"),
-    bigquery.SchemaField("review_time_secs",        "FLOAT"),
-    bigquery.SchemaField("avg_review_tpt_secs",     "FLOAT",   mode="NULLABLE"),
-]
+_GUEST_PATTERN = re.compile(r"guest\+([^@]+)@encord\.com", re.IGNORECASE)
 
 
-# ─── Workspace Detection ──────────────────────────────────────────────────────
-def get_workspace(creator_email: str) -> str:
-    """
-    Derive client workspace from creator_email.
-      guest+wayve@encord.com      → Wayve
-      guest+boston-dynamics@encord.com → Boston Dynamics
-      someone@encord.com          → Encord (Internal)
-      someone@clientdomain.com    → Clientdomain
-    """
+def derive_client_workspace(creator_email: Optional[str]) -> str:
+    """Derive client/workspace name from creator_email."""
     if not creator_email:
-        return "Unknown"
-    email = creator_email.lower().strip()
-    m = re.match(r'guest\+(.+)@encord\.com', email)
+        return "unknown"
+    m = _GUEST_PATTERN.match(creator_email.strip())
     if m:
-        name = m.group(1).replace('.', ' ').replace('-', ' ').replace('_', ' ')
-        return name.title()
-    if email.endswith('@encord.com'):
-        return 'Encord (Internal)'
-    domain = email.split('@')[-1]
-    company = domain.split('.')[0]
-    return company.replace('-', ' ').replace('_', ' ').title()
+        # guest+client_name@encord.com → "Client Name"
+        raw = m.group(1).replace("_", " ").replace("-", " ")
+        return raw.title()
+    # Non-guest email → use domain as workspace name
+    domain = creator_email.split("@")[-1].split(".")[0]
+    return domain.title()
 
 
-# ─── Metric Helpers ───────────────────────────────────────────────────────────
-def classify_stage(node_title: str, stage_type: str) -> str:
-    t = (node_title or '').upper()
-    s = (stage_type or '').upper()
-    if any(w in t for w in ('COMPLETE', 'DONE', 'FINAL', 'ARCHIVE')):
-        return 'complete'
-    if 'REVIEW' in s or 'REVIEW' in t:
-        return 'review'
-    if 'ANNOTATION' in s or 'ANNOTAT' in t:
-        return 'annotation'
-    return 'other'
+# ─────────────────────────────────────────────────────────────────────────────
+# BIGQUERY SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCHEMA_PROJECTS = [
+    SchemaField("project_hash",       "STRING",    mode="REQUIRED"),
+    SchemaField("title",              "STRING"),
+    SchemaField("description",        "STRING"),
+    SchemaField("creator_email",      "STRING"),
+    SchemaField("client_workspace",   "STRING"),
+    SchemaField("created_at",         "TIMESTAMP"),
+    SchemaField("last_edited_at",     "TIMESTAMP"),
+    SchemaField("project_type",       "STRING"),
+    SchemaField("status",             "STRING"),
+    SchemaField("ontology_hash",      "STRING"),
+    SchemaField("ingested_at",        "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_WORKFLOW_STAGES = [
+    SchemaField("project_hash",  "STRING",    mode="REQUIRED"),
+    SchemaField("stage_uuid",    "STRING",    mode="REQUIRED"),
+    SchemaField("stage_title",   "STRING"),
+    SchemaField("stage_type",    "STRING"),
+    SchemaField("ingested_at",   "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_TASKS_SNAPSHOT = [
+    SchemaField("project_hash",      "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",  "STRING"),
+    SchemaField("project_title",     "STRING"),
+    SchemaField("task_uuid",         "STRING",    mode="REQUIRED"),
+    SchemaField("data_hash",         "STRING"),
+    SchemaField("data_title",        "STRING"),
+    SchemaField("stage_uuid",        "STRING"),
+    SchemaField("stage_title",       "STRING"),
+    SchemaField("stage_type",        "STRING"),
+    SchemaField("task_status",       "STRING"),
+    SchemaField("assignee_email",    "STRING"),
+    SchemaField("is_complete",       "BOOL"),
+    SchemaField("snapshot_at",       "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_TIME_SPENT = [
+    SchemaField("project_hash",        "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",    "STRING"),
+    SchemaField("project_title",       "STRING"),
+    SchemaField("user_email",          "STRING",    mode="REQUIRED"),
+    SchemaField("project_user_role",   "STRING"),
+    SchemaField("data_uuid",           "STRING"),
+    SchemaField("data_title",          "STRING"),
+    SchemaField("dataset_uuid",        "STRING"),
+    SchemaField("dataset_title",       "STRING"),
+    SchemaField("workflow_task_uuid",  "STRING"),
+    SchemaField("stage_uuid",          "STRING"),
+    SchemaField("stage_title",         "STRING"),
+    SchemaField("stage_type",          "STRING"),
+    SchemaField("period_start_time",   "TIMESTAMP", mode="REQUIRED"),
+    SchemaField("period_end_time",     "TIMESTAMP"),
+    SchemaField("time_spent_seconds",  "INT64"),
+    SchemaField("ingested_at",         "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_TASK_ACTIONS = [
+    SchemaField("project_hash",         "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",     "STRING"),
+    SchemaField("project_title",        "STRING"),
+    SchemaField("task_uuid",            "STRING",    mode="REQUIRED"),
+    SchemaField("data_unit_uuid",       "STRING"),
+    SchemaField("workflow_stage_uuid",  "STRING"),
+    SchemaField("actor_email",          "STRING"),
+    SchemaField("action_type",          "STRING"),
+    SchemaField("event_timestamp",      "TIMESTAMP", mode="REQUIRED"),
+    SchemaField("ingested_at",          "TIMESTAMP", mode="REQUIRED"),
+]
+
+# Incremental sync state (tracks last_edited_at per project)
+SCHEMA_SYNC_STATE = [
+    SchemaField("project_hash",      "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",  "STRING"),
+    SchemaField("project_title",     "STRING"),
+    SchemaField("last_edited_at",    "TIMESTAMP"),
+    SchemaField("last_synced_at",    "TIMESTAMP"),
+    SchemaField("created_at",        "TIMESTAMP"),
+]
 
 
-def median(values: list) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+# ─────────────────────────────────────────────────────────────────────────────
+# BIGQUERY SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_dataset(bq: bigquery.Client) -> None:
+    """Create dataset if it doesn't exist."""
+    ds_ref = bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}")
+    ds_ref.location = "US"
+    bq.create_dataset(ds_ref, exists_ok=True)
+    log.info("Dataset ready: %s.%s", GCP_PROJECT, BQ_DATASET)
 
 
-# ─── Per-Project Processing ───────────────────────────────────────────────────
-def process_project(project, snapshot_date: str, workspace: str):
-    ph    = str(project.project_hash)
-    title = str(project.title)
-    creator = str(getattr(project, 'creator_email', '') or '')
+def ensure_table(bq: bigquery.Client, table_id: str, schema: list,
+                 partition_field: Optional[str] = None,
+                 cluster_fields: Optional[list] = None) -> bigquery.Table:
+    """Create table if it doesn't exist."""
+    full_id = f"{GCP_PROJECT}.{BQ_DATASET}.{table_id}"
+    table = bigquery.Table(full_id, schema=schema)
 
-    print(f"    Processing: {title[:55]}")
+    if partition_field:
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field=partition_field,
+        )
+    if cluster_fields:
+        table.clustering_fields = cluster_fields
 
-    # ── 1. Task Progress (label rows) ─────────────────────────────────────────
-    label_rows = list(project.list_label_rows_v2())
-    stage_counts = defaultdict(int)
-    for lr in label_rows:
-        wf = getattr(lr, 'workflow_graph_node', None)
-        nt = str(getattr(wf, 'title', '') or '') if wf else ''
-        st = str(getattr(wf, 'stage_type', '') or '') if wf else ''
-        stage_counts[classify_stage(nt, st)] += 1
+    bq.create_table(table, exists_ok=True)
+    return bq.get_table(full_id)
 
-    total = len(label_rows)
-    progress_pct = round(stage_counts['complete'] / total * 100, 1) if total else 0.0
 
-    # ── 2. Time Entries ───────────────────────────────────────────────────────
-    dt_end   = dt.datetime.now(dt.timezone.utc)
-    dt_start = dt_end - dt.timedelta(days=DAYS_BACK)
+def setup_tables(bq: bigquery.Client) -> None:
+    ensure_dataset(bq)
+    ensure_table(bq, "projects",        SCHEMA_PROJECTS)
+    ensure_table(bq, "workflow_stages", SCHEMA_WORKFLOW_STAGES)
+    ensure_table(bq, "tasks_snapshot",  SCHEMA_TASKS_SNAPSHOT,
+                 partition_field="snapshot_at",
+                 cluster_fields=["project_hash", "client_workspace"])
+    ensure_table(bq, "time_spent",      SCHEMA_TIME_SPENT,
+                 partition_field="period_start_time",
+                 cluster_fields=["project_hash", "user_email"])
+    ensure_table(bq, "task_actions",    SCHEMA_TASK_ACTIONS,
+                 partition_field="event_timestamp",
+                 cluster_fields=["project_hash", "actor_email", "action_type"])
+    ensure_table(bq, "sync_state",      SCHEMA_SYNC_STATE)
+    log.info("All tables ready.")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD SYNC STATE (last_edited_at per project)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_sync_state(bq: bigquery.Client) -> dict[str, dt.datetime]:
+    """Returns {project_hash: last_edited_at} from sync_state table."""
     try:
-        entries = list(project.list_time_spent(start=dt_start, end=dt_end))
-    except Exception as ex:
-        print(f"      ⚠ list_time_spent: {ex}")
-        entries = []
-
-    ann_secs  = defaultdict(float)   # email → annotation seconds
-    rev_secs  = defaultdict(float)   # email → review seconds
-    ann_uuids = defaultdict(set)     # email → unique data_uuids annotated
-    rev_uuids = defaultdict(set)     # email → unique data_uuids reviewed
-    ann_dates = defaultdict(set)     # email → dates active
-
-    for e in entries:
-        wf    = getattr(e, 'workflow_stage', None)
-        stype = str(getattr(wf, 'stage_type', '') or '').upper() if wf else ''
-        secs  = float(getattr(e, 'time_spent_seconds', 0) or 0)
-        email = str(getattr(e, 'user_email', '') or 'unknown')
-        uid   = str(getattr(e, 'data_uuid', '') or '')
-        ps    = getattr(e, 'period_start_time', None)
-        day   = ps.date().isoformat() if ps and hasattr(ps, 'date') else snapshot_date
-
-        if 'ANNOTATION' in stype:
-            ann_secs[email]  += secs
-            ann_dates[email].add(day)
-            if uid:
-                ann_uuids[email].add(uid)
-        elif 'REVIEW' in stype:
-            rev_secs[email] += secs
-            if uid:
-                rev_uuids[email].add(uid)
-
-    # ── 3. Label Logs → Rejections / Approvals ────────────────────────────────
-    submitted_by      = defaultdict(set)   # data_hash → {annotator emails}
-    approved_hashes   = set()
-    rejected_hashes   = set()
-    reviewer_approved = defaultdict(set)   # reviewer → {data_hashes}
-    reviewer_rejected = defaultdict(set)
-
-    try:
-        logs = list(project.get_editor_logs())
-    except Exception:
-        try:
-            logs = list(project.get_label_logs())   # fallback for older SDK
-        except Exception as ex:
-            print(f"      ⚠ get_editor_logs: {ex}")
-            logs = []
-
-    for log in logs:
-        action = str(getattr(log, 'action', '') or '').upper()
-        email  = str(getattr(log, 'user_email', '') or 'unknown')
-        dh     = str(getattr(log, 'data_hash', '') or '')
-        if not dh:
-            continue
-        if 'SUBMIT' in action:
-            submitted_by[dh].add(email)
-        elif 'APPROVE' in action:
-            reviewer_approved[email].add(dh)
-            if dh not in rejected_hashes:
-                approved_hashes.add(dh)
-        elif 'REJECT' in action:
-            reviewer_rejected[email].add(dh)
-            rejected_hashes.add(dh)
-            approved_hashes.discard(dh)   # "rejected wins" rule
-
-    # Per-annotator submit outcomes
-    ann_submitted = defaultdict(set)
-    ann_approved  = defaultdict(int)
-    ann_rejected  = defaultdict(int)
-
-    for dh, submitters in submitted_by.items():
-        for email in submitters:
-            ann_submitted[email].add(dh)
-            if dh in rejected_hashes:
-                ann_rejected[email] += 1
-            elif dh in approved_hashes:
-                ann_approved[email] += 1
-
-    # ── 4. Per-Annotator Rows ─────────────────────────────────────────────────
-    all_annotators = set(ann_secs.keys()) | set(ann_submitted.keys())
-    ann_rows_raw   = []
-    rej_rates, tpts, throughputs = [], [], []
-
-    for email in all_annotators:
-        tasks     = len(ann_uuids[email]) or len(ann_submitted[email])
-        sub       = len(ann_submitted[email])
-        app       = ann_approved[email]
-        rej       = ann_rejected[email]
-        denom     = app + rej
-        rej_rate  = round(rej / denom * 100, 2) if denom > 0 else None
-
-        ann_t     = ann_secs[email]
-        tpt       = round(ann_t / tasks, 2) if tasks > 0 else None
-
-        dates     = ann_dates[email]
-        if dates:
-            min_d = min(dates)
-            max_d = max(dates)
-            days  = (dt.date.fromisoformat(max_d) - dt.date.fromisoformat(min_d)).days + 1
-        else:
-            days = None
-
-        throughput = round(tasks / days, 2) if days and tasks else None
-
-        has_ann = ann_t > 0
-        has_rev = rev_secs.get(email, 0) > 0
-        role    = ('Annotator & Reviewer' if has_ann and has_rev
-                   else 'Reviewer' if has_rev else 'Annotator')
-
-        if rej_rate is not None:
-            rej_rates.append(rej_rate)
-        if tpt is not None:
-            tpts.append(tpt)
-        if throughput is not None:
-            throughputs.append(throughput)
-
-        ann_rows_raw.append(dict(
-            email=email, role=role,
-            tasks=tasks, sub=sub, app=app, rej=rej,
-            rej_rate=rej_rate, ann_t=ann_t, tpt=tpt,
-            days=days, throughput=throughput,
-        ))
-
-    # ── 5. Outlier Flags ──────────────────────────────────────────────────────
-    proj_avg_rej   = sum(rej_rates) / len(rej_rates) if rej_rates else 0
-    med_tpt        = median(tpts)
-    med_throughput = median(throughputs)
-
-    annotator_bq_rows = []
-    critical_flags = 0
-    warning_flags  = 0
-
-    for a in ann_rows_raw:
-        flag_high_rej = bool(a['rej_rate'] is not None and a['rej_rate'] > proj_avg_rej + 10)
-        flag_too_fast = bool(a['tpt'] is not None and med_tpt > 0 and a['tpt'] < med_tpt * 0.2)
-        flag_too_slow = bool(a['tpt'] is not None and med_tpt > 0 and a['tpt'] > med_tpt * 1.5)
-        flag_low_tp   = bool(a['throughput'] is not None and med_throughput > 0
-                             and a['throughput'] < med_throughput * 0.8)
-
-        if flag_high_rej:
-            critical_flags += 1
-        if flag_too_fast or flag_too_slow or flag_low_tp:
-            warning_flags += 1
-
-        status = ('crit' if flag_high_rej
-                  else 'warn' if (flag_too_fast or flag_too_slow or flag_low_tp)
-                  else 'good')
-
-        annotator_bq_rows.append({
-            'snapshot_date':        snapshot_date,
-            'client_workspace':     workspace,
-            'project_hash':         ph,
-            'project_title':        title,
-            'annotator_email':      a['email'],
-            'role':                 a['role'],
-            'tasks_annotated':      a['tasks'],
-            'tasks_submitted':      a['sub'],
-            'tasks_approved':       a['app'],
-            'tasks_rejected':       a['rej'],
-            'rejection_rate':       a['rej_rate'],
-            'annotation_time_secs': round(a['ann_t'], 2),
-            'avg_tpt_secs':         a['tpt'],
-            'days_active':          a['days'],
-            'throughput_per_day':   a['throughput'],
-            'flag_high_rejection':  flag_high_rej,
-            'flag_too_fast':        flag_too_fast,
-            'flag_too_slow':        flag_too_slow,
-            'flag_low_throughput':  flag_low_tp,
-            'health_status':        status,
-        })
-
-    # ── 6. Per-Reviewer Rows ──────────────────────────────────────────────────
-    reviewer_bq_rows = []
-    all_reviewers = (set(rev_secs.keys())
-                     | set(reviewer_approved.keys())
-                     | set(reviewer_rejected.keys()))
-
-    for rev in all_reviewers:
-        r_app   = len(reviewer_approved.get(rev, set()))
-        r_rej   = len(reviewer_rejected.get(rev, set()))
-        r_total = r_app + r_rej
-        r_rate  = round(r_rej / r_total * 100, 2) if r_total > 0 else None
-        r_time  = rev_secs.get(rev, 0.0)
-        r_tasks = len(rev_uuids.get(rev, set()))
-        r_tpt   = round(r_time / r_tasks, 2) if r_tasks > 0 else None
-
-        reviewer_bq_rows.append({
-            'snapshot_date':       snapshot_date,
-            'client_workspace':    workspace,
-            'project_hash':        ph,
-            'project_title':       title,
-            'reviewer_email':      rev,
-            'tasks_reviewed':      r_tasks,
-            'tasks_approved':      r_app,
-            'tasks_rejected':      r_rej,
-            'rejection_rate':      r_rate,
-            'review_time_secs':    round(r_time, 2),
-            'avg_review_tpt_secs': r_tpt,
-        })
-
-    # ── 7. Project Health Row ─────────────────────────────────────────────────
-    total_app  = len(approved_hashes)
-    total_rej  = len(rejected_hashes)
-    denom      = total_app + total_rej
-    proj_rej   = round(total_rej / denom * 100, 2) if denom > 0 else None
-
-    health = ('Critical' if proj_rej is not None and proj_rej > 15
-              else 'Warning' if proj_rej is not None and proj_rej > 10
-              else 'Healthy')
-
-    total_ann_secs  = sum(ann_secs.values())
-    total_rev_secs  = sum(rev_secs.values())
-    total_tasks_cnt = sum(len(v) for v in ann_uuids.values())
-    avg_tpt         = round(total_ann_secs / total_tasks_cnt, 2) if total_tasks_cnt > 0 else None
-
-    project_row = {
-        'snapshot_date':         snapshot_date,
-        'client_workspace':      workspace,
-        'project_hash':          ph,
-        'project_title':         title,
-        'creator_email':         creator,
-        'total_tasks':           total,
-        'tasks_complete':        stage_counts['complete'],
-        'tasks_in_review':       stage_counts['review'],
-        'tasks_in_annotation':   stage_counts['annotation'],
-        'progress_pct':          progress_pct,
-        'project_rejection_rate': proj_rej,
-        'total_approved':        total_app,
-        'total_rejected':        total_rej,
-        'active_annotators':     len(all_annotators),
-        'active_reviewers':      len(all_reviewers),
-        'total_annotation_secs': round(total_ann_secs, 2),
-        'total_review_secs':     round(total_rev_secs, 2),
-        'avg_tpt_secs':          avg_tpt,
-        'health_status':         health,
-        'critical_flags':        critical_flags,
-        'warning_flags':         warning_flags,
-    }
-
-    print(f"      ✓ {health:<8} | {stage_counts['complete']}/{total} done "
-          f"| rej {proj_rej}% | {len(all_annotators)} annotators")
-
-    return project_row, annotator_bq_rows, reviewer_bq_rows
+        query = f"""
+            SELECT project_hash, last_edited_at
+            FROM `{GCP_PROJECT}.{BQ_DATASET}.sync_state`
+            WHERE last_edited_at IS NOT NULL
+        """
+        results = bq.query(query).result()
+        state = {}
+        for row in results:
+            if row.last_edited_at:
+                ts = row.last_edited_at
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                state[row.project_hash] = ts
+        log.info("Loaded sync state for %d projects.", len(state))
+        return state
+    except Exception as e:
+        log.warning("Could not load sync state (first run?): %s", e)
+        return {}
 
 
-# ─── BigQuery Helpers ─────────────────────────────────────────────────────────
-def ensure_dataset(bq: bigquery.Client):
-    ds = bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}")
-    ds.location = "US"
-    bq.create_dataset(ds, exists_ok=True)
-
-
-def delete_today(bq: bigquery.Client, snapshot_date: str):
-    """Delete today's rows before re-inserting (idempotent re-runs)."""
-    for table in [TABLE_PROJECT, TABLE_ANNOTATOR, TABLE_REVIEWER]:
-        try:
-            bq.query(
-                f"DELETE FROM `{table}` WHERE snapshot_date = '{snapshot_date}'"
-            ).result()
-        except Exception:
-            pass  # Table may not exist yet on first run
-
-
-def bq_insert(bq: bigquery.Client, rows: list, table: str, schema: list):
+def save_sync_state(bq: bigquery.Client, rows: list[dict]) -> None:
+    """Upsert sync state for synced projects."""
     if not rows:
         return
-    job = bq.load_table_from_json(
-        rows, table,
-        job_config=bigquery.LoadJobConfig(
-            write_disposition="WRITE_APPEND",
-            schema=schema,
-        )
-    )
-    job.result()
-    print(f"    ✓ Wrote {len(rows):>5} rows → {table.split('.')[-1]}")
+    # Delete old rows for these project_hashes then insert
+    hashes = ", ".join(f"'{r['project_hash']}'" for r in rows)
+    bq.query(f"""
+        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.sync_state`
+        WHERE project_hash IN ({hashes})
+    """).result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.sync_state")
+    errors = bq.insert_rows_json(table, rows)
+    if errors:
+        log.error("Sync state write errors: %s", errors)
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
-    snapshot_date = dt.date.today().isoformat()
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTRACTION — one project at a time (runs in thread pool)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print(f"\n{'═'*65}")
-    print(f"  Encord → BigQuery Sync  |  {snapshot_date}")
-    print(f"  Time window : last {DAYS_BACK} days")
-    print(f"  Dataset     : {GCP_PROJECT}.{BQ_DATASET}")
-    print(f"{'═'*65}\n")
+def extract_project(project: Project, now: dt.datetime) -> dict:
+    """Extract all data for a single project. Returns dict of row lists."""
+    ph = str(project.project_hash)
+    workspace = derive_client_workspace(getattr(project, "creator_email", None))
+    title = project.title
+    since = getattr(project, "created_at", BACKFILL_FROM) or BACKFILL_FROM
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=dt.timezone.utc)
 
-    # ── Connect to Encord ─────────────────────────────────────────────────────
-    key_path = os.environ.get("ENCORD_SSH_KEY_PATH", "")
-    key_str  = os.environ.get("ENCORD_SSH_KEY", "")
-    domain   = os.environ.get("ENCORD_DOMAIN", "https://api.encord.com")
+    result = {
+        "project_hash": ph,
+        "project_title": title,
+        "client_workspace": workspace,
+        "stages": [],
+        "tasks": [],
+        "time": [],
+        "actions": [],
+    }
 
-    if key_path and os.path.exists(key_path):
-        client = EncordUserClient.create_with_ssh_private_key(
-            ssh_private_key_path=key_path, domain=domain)
-    elif key_str:
-        client = EncordUserClient.create_with_ssh_private_key(
-            ssh_private_key=key_str, domain=domain)
-    else:
-        raise ValueError("Set ENCORD_SSH_KEY_PATH or ENCORD_SSH_KEY env variable")
+    # ── Workflow stages ──
+    wf = getattr(project, "workflow", None)
+    if wf:
+        for stage in wf.stages:
+            result["stages"].append({
+                "project_hash": ph,
+                "stage_uuid":   str(stage.uuid),
+                "stage_title":  stage.title,
+                "stage_type":   str(stage.stage_type),
+                "ingested_at":  now.isoformat(),
+            })
 
-    # ── Connect to BigQuery ───────────────────────────────────────────────────
-    bq = bigquery.Client(project=GCP_PROJECT)
-    ensure_dataset(bq)
-    delete_today(bq, snapshot_date)
-
-    # ── Discover all projects ─────────────────────────────────────────────────
-    print("► Discovering projects from SSH key...")
-    all_projects = list(client.list_projects())
-    print(f"  Found {len(all_projects)} projects\n")
-
-    # ── Process each project ──────────────────────────────────────────────────
-    proj_rows = []
-    ann_rows  = []
-    rev_rows  = []
-
-    print("► Processing projects...\n")
-    for i, p_meta in enumerate(all_projects, 1):
-        try:
-            # Get project hash from whatever format list_projects() returns
-            if isinstance(p_meta, dict):
-                ph = (p_meta.get('project', {}).get('project_hash')
-                      or p_meta.get('project_hash', ''))
-            else:
-                ph = str(getattr(p_meta, 'project_hash', ''))
-
-            if not ph:
+        # ── Task snapshot (current state of all tasks) ──
+        for stage in wf.stages:
+            is_annotation = isinstance(stage, (AnnotationStage, ConsensusAnnotationStage))
+            is_review     = isinstance(stage, (ReviewStage, ConsensusReviewStage))
+            is_final      = isinstance(stage, FinalStage)
+            if not (is_annotation or is_review or is_final):
                 continue
+            try:
+                for task in stage.get_tasks():
+                    status   = getattr(task, "status", None)
+                    assignee = getattr(task, "assignee", None)
+                    result["tasks"].append({
+                        "project_hash":     ph,
+                        "client_workspace": workspace,
+                        "project_title":    title,
+                        "task_uuid":        str(task.uuid),
+                        "data_hash":        str(task.data_hash) if getattr(task, "data_hash", None) else None,
+                        "data_title":       getattr(task, "data_title", None),
+                        "stage_uuid":       str(stage.uuid),
+                        "stage_title":      stage.title,
+                        "stage_type":       str(stage.stage_type),
+                        "task_status":      str(status) if status else None,
+                        "assignee_email":   str(assignee) if assignee else None,
+                        "is_complete":      is_final,
+                        "snapshot_at":      now.isoformat(),
+                    })
+            except Exception as e:
+                log.warning("[%s] tasks error @ %s: %s", title, stage.title, e)
 
-            project   = client.get_project(ph)
-            creator   = str(getattr(project, 'creator_email', '') or '')
-            workspace = get_workspace(creator)
+    # ── Time spent (full history from project start) ──
+    try:
+        for ts in project.list_time_spent(start=since):
+            stage = ts.workflow_stage
+            result["time"].append({
+                "project_hash":       ph,
+                "client_workspace":   workspace,
+                "project_title":      title,
+                "user_email":         ts.user_email,
+                "project_user_role":  str(ts.project_user_role) if ts.project_user_role else None,
+                "data_uuid":          str(ts.data_uuid) if ts.data_uuid else None,
+                "data_title":         ts.data_title,
+                "dataset_uuid":       str(ts.dataset_uuid) if ts.dataset_uuid else None,
+                "dataset_title":      ts.dataset_title,
+                "workflow_task_uuid": str(ts.workflow_task_uuid) if ts.workflow_task_uuid else None,
+                "stage_uuid":         str(stage.uuid) if stage else None,
+                "stage_title":        stage.title if stage else None,
+                "stage_type":         str(stage.stage_type) if stage else None,
+                "period_start_time":  ts.period_start_time.isoformat() if ts.period_start_time else None,
+                "period_end_time":    ts.period_end_time.isoformat() if ts.period_end_time else None,
+                "time_spent_seconds": int(ts.time_spent_seconds),
+                "ingested_at":        now.isoformat(),
+            })
+    except Exception as e:
+        log.warning("[%s] list_time_spent error: %s", title, e)
 
-            print(f"  [{i:>4}/{len(all_projects)}] {workspace:<30} {project.title[:40]}")
+    # ── Task actions — approve / reject / submit / assign / etc ──
+    try:
+        for a in project.get_task_actions(
+            after=since,
+            action_type=[
+                TaskActionType.APPROVE,
+                TaskActionType.REJECT,
+                TaskActionType.SUBMIT,
+                TaskActionType.ASSIGN,
+                TaskActionType.RELEASE,
+                TaskActionType.SKIP,
+                TaskActionType.MOVE,
+            ],
+        ):
+            result["actions"].append({
+                "project_hash":        ph,
+                "client_workspace":    workspace,
+                "project_title":       title,
+                "task_uuid":           str(a.task_uuid),
+                "data_unit_uuid":      str(a.data_unit_uuid) if a.data_unit_uuid else None,
+                "workflow_stage_uuid": str(a.workflow_stage_uuid) if a.workflow_stage_uuid else None,
+                "actor_email":         a.actor_email,
+                "action_type":         str(a.action_type),
+                "event_timestamp":     a.timestamp.isoformat() if a.timestamp else now.isoformat(),
+                "ingested_at":         now.isoformat(),
+            })
+    except Exception as e:
+        log.warning("[%s] get_task_actions error: %s", title, e)
 
-            p_row, a_rows, r_rows = process_project(project, snapshot_date, workspace)
-            proj_rows.append(p_row)
-            ann_rows.extend(a_rows)
-            rev_rows.extend(r_rows)
+    log.info("  ✓ %s — %d tasks | %d time entries | %d actions",
+             title, len(result["tasks"]), len(result["time"]), len(result["actions"]))
+    return result
 
-            # Flush to BigQuery every 100 projects to avoid memory build-up
-            if i % 100 == 0:
-                print(f"\n  ── Flushing batch {i} to BigQuery ──")
-                bq_insert(bq, proj_rows, TABLE_PROJECT,   SCHEMA_PROJECT)
-                bq_insert(bq, ann_rows,  TABLE_ANNOTATOR, SCHEMA_ANNOTATOR)
-                bq_insert(bq, rev_rows,  TABLE_REVIEWER,  SCHEMA_REVIEWER)
-                proj_rows, ann_rows, rev_rows = [], [], []
-                print()
 
-        except KeyboardInterrupt:
-            break
-        except Exception as ex:
-            print(f"    ✗ Skipping [{i}]: {ex}")
-            traceback.print_exc()
+# ─────────────────────────────────────────────────────────────────────────────
+# BIGQUERY WRITE — replace project data (tasks), append time + actions
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Final flush
-    print("\n► Writing final batch to BigQuery...")
-    bq_insert(bq, proj_rows, TABLE_PROJECT,   SCHEMA_PROJECT)
-    bq_insert(bq, ann_rows,  TABLE_ANNOTATOR, SCHEMA_ANNOTATOR)
-    bq_insert(bq, rev_rows,  TABLE_REVIEWER,  SCHEMA_REVIEWER)
+def write_project_rows(bq: bigquery.Client, project_row: dict) -> None:
+    """Upsert project metadata."""
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.projects")
+    ph = project_row["project_hash"]
+    bq.query(f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.projects` WHERE project_hash = '{ph}'").result()
+    errors = bq.insert_rows_json(table, [project_row])
+    if errors:
+        log.error("projects write error: %s", errors)
 
-    print(f"\n{'═'*65}")
-    print(f"  ✅  Sync complete  |  {dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}")
-    print(f"{'═'*65}\n")
+
+def write_stage_rows(bq: bigquery.Client, ph: str, rows: list) -> None:
+    if not rows:
+        return
+    bq.query(f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.workflow_stages` WHERE project_hash = '{ph}'").result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.workflow_stages")
+    errors = bq.insert_rows_json(table, rows)
+    if errors:
+        log.error("stages write error: %s", errors)
+
+
+def write_task_snapshot(bq: bigquery.Client, ph: str, rows: list) -> None:
+    """Replace today's snapshot for this project."""
+    if not rows:
+        return
+    today = dt.date.today().isoformat()
+    bq.query(f"""
+        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.tasks_snapshot`
+        WHERE project_hash = '{ph}'
+        AND DATE(snapshot_at) = '{today}'
+    """).result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.tasks_snapshot")
+    # Insert in batches of 1000
+    for i in range(0, len(rows), 1000):
+        errors = bq.insert_rows_json(table, rows[i:i+1000])
+        if errors:
+            log.error("tasks_snapshot write error (batch %d): %s", i // 1000, errors)
+
+
+def write_time_spent(bq: bigquery.Client, ph: str, rows: list) -> None:
+    """Append time entries — idempotent via DELETE of today's rows first."""
+    if not rows:
+        return
+    today = dt.date.today().isoformat()
+    # Delete today's rows for this project before reinserting (handles reruns)
+    bq.query(f"""
+        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.time_spent`
+        WHERE project_hash = '{ph}'
+        AND DATE(ingested_at) = '{today}'
+    """).result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.time_spent")
+    for i in range(0, len(rows), 1000):
+        errors = bq.insert_rows_json(table, rows[i:i+1000])
+        if errors:
+            log.error("time_spent write error (batch %d): %s", i // 1000, errors)
+
+
+def write_task_actions(bq: bigquery.Client, ph: str, rows: list) -> None:
+    """Append task actions — idempotent via DELETE of today's rows first."""
+    if not rows:
+        return
+    today = dt.date.today().isoformat()
+    bq.query(f"""
+        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.task_actions`
+        WHERE project_hash = '{ph}'
+        AND DATE(ingested_at) = '{today}'
+    """).result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.task_actions")
+    for i in range(0, len(rows), 1000):
+        errors = bq.insert_rows_json(table, rows[i:i+1000])
+        if errors:
+            log.error("task_actions write error (batch %d): %s", i // 1000, errors)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+
+    print("═" * 65)
+    print(f"  Encord → BigQuery Sync  |  {today_str}")
+    print(f"  Dataset     : {GCP_PROJECT}.{BQ_DATASET}")
+    print(f"  Domain      : {ENCORD_DOMAIN}")
+    print("═" * 65)
+
+    # ── Connect ──
+    user_client = EncordUserClient.create_with_ssh_private_key(
+        ssh_private_key_path=SSH_KEY_PATH,
+        domain=ENCORD_DOMAIN,
+    )
+    bq = bigquery.Client(project=GCP_PROJECT)
+
+    # ── Ensure tables exist ──
+    setup_tables(bq)
+
+    # ── Load incremental sync state ──
+    sync_state = load_sync_state(bq)
+
+    # ── Discover all projects ──
+    log.info("Fetching project list...")
+    all_projects = list(user_client.list_projects(include_org_access=True))
+    log.info("Found %d projects total.", len(all_projects))
+
+    # ── Determine which need syncing ──
+    to_sync = []
+    skipped = 0
+    for project in all_projects:
+        ph = str(project.project_hash)
+        stored = sync_state.get(ph)
+        proj_last_edited = getattr(project, "last_edited_at", None)
+
+        if stored and proj_last_edited:
+            if proj_last_edited.tzinfo is None:
+                proj_last_edited = proj_last_edited.replace(tzinfo=dt.timezone.utc)
+            if proj_last_edited <= stored:
+                skipped += 1
+                continue   # unchanged — skip
+
+        to_sync.append(project)
+
+    log.info("To sync: %d | Skipped (unchanged): %d", len(to_sync), skipped)
+
+    if not to_sync:
+        log.info("Nothing to sync. All projects up to date.")
+        return
+
+    # ── Sync in parallel ──
+    synced = 0
+    failed = 0
+    new_sync_state = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {
+            executor.submit(extract_project, p, now): p
+            for p in to_sync
+        }
+
+        for future in as_completed(future_map):
+            project = future_map[future]
+            ph = str(project.project_hash)
+            try:
+                data = future.result()
+
+                # Write project metadata
+                proj_row = {
+                    "project_hash":     ph,
+                    "title":            project.title,
+                    "description":      getattr(project, "description", None),
+                    "creator_email":    getattr(project, "creator_email", None),
+                    "client_workspace": data["client_workspace"],
+                    "created_at":       project.created_at.isoformat() if project.created_at else None,
+                    "last_edited_at":   project.last_edited_at.isoformat() if getattr(project, "last_edited_at", None) else None,
+                    "project_type":     str(project.project_type) if getattr(project, "project_type", None) else None,
+                    "status":           str(project.status) if getattr(project, "status", None) else None,
+                    "ontology_hash":    getattr(project, "ontology_hash", None),
+                    "ingested_at":      now.isoformat(),
+                }
+                write_project_rows(bq, proj_row)
+                write_stage_rows(bq, ph, data["stages"])
+                write_task_snapshot(bq, ph, data["tasks"])
+                write_time_spent(bq, ph, data["time"])
+                write_task_actions(bq, ph, data["actions"])
+
+                # Record new sync state
+                new_sync_state.append({
+                    "project_hash":     ph,
+                    "client_workspace": data["client_workspace"],
+                    "project_title":    project.title,
+                    "last_edited_at":   project.last_edited_at.isoformat() if getattr(project, "last_edited_at", None) else now.isoformat(),
+                    "last_synced_at":   now.isoformat(),
+                    "created_at":       project.created_at.isoformat() if project.created_at else None,
+                })
+                synced += 1
+
+            except Exception as e:
+                log.error("  ✗ [%s] failed: %s", project.title, e)
+                failed += 1
+
+    # ── Save sync state ──
+    save_sync_state(bq, new_sync_state)
+
+    print("═" * 65)
+    print(f"  Sync complete")
+    print(f"  ✓ Synced  : {synced}")
+    print(f"  ⏭ Skipped : {skipped}")
+    print(f"  ✗ Failed  : {failed}")
+    print("═" * 65)
 
 
 if __name__ == "__main__":
