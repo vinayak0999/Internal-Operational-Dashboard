@@ -206,10 +206,13 @@ def process_project(project, snapshot_date: str, workspace: str):
     reviewer_rejected = defaultdict(set)
 
     try:
-        logs = list(project.get_label_logs())
-    except Exception as ex:
-        print(f"      ⚠ get_label_logs: {ex}")
-        logs = []
+        logs = list(project.get_editor_logs())
+    except Exception:
+        try:
+            logs = list(project.get_label_logs())   # fallback for older SDK
+        except Exception as ex:
+            print(f"      ⚠ get_editor_logs: {ex}")
+            logs = []
 
     for log in logs:
         action = str(getattr(log, 'action', '') or '').upper()
