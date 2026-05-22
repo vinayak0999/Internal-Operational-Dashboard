@@ -28,7 +28,7 @@ jobs:
           printf '%s\n' "$ENCORD_SSH_KEY" > /tmp/encord_key
           chmod 600 /tmp/encord_key
         env:
-          ENCORD_SSH_KEY: ${{ secrets.ENCORD_SSH_KEY }}
+          ENCORD_SSH_KEY: ${{ secrets.DASH_ENCORD_SSH_KEY }}
 
       - name: Write Encord US SSH key to disk (if set)
         run: |
@@ -51,4 +51,4 @@ jobs:
           ENCORD_US_DOMAIN: https://api.us.encord.com
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
-        run: python sync/encord_to_bigquery.py
+        run: python Internal-Operational-Dashboard/sync/encord_to_bigquery.py
