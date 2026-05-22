@@ -36,11 +36,11 @@ import datetime as dt
 import logging
 import os
 import re
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
-from typing import Iterator, List, Optional
+from typing import Optional
 
 from encord import EncordUserClient, Project
 from encord.orm.analytics import TaskActionType
@@ -84,7 +84,16 @@ US_DOMAIN        = os.environ.get("ENCORD_US_DOMAIN", "https://api.us.encord.com
 GCP_PROJECT      = os.environ["GCP_PROJECT"]
 BQ_DATASET       = os.environ["BQ_DATASET"]
 MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", "5"))
+PROJECT_TIMEOUT  = int(os.environ.get("PROJECT_TIMEOUT_SEC", "120"))  # per-project SDK timeout
 BACKFILL_FROM    = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)  # floor for history
+
+
+class ProjectTimeoutError(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise ProjectTimeoutError("SDK call timed out")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLIENT WORKSPACE MAPPING
@@ -410,6 +419,22 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     return result
 
 
+def extract_project_with_timeout(project: Project, now: dt.datetime) -> dict:
+    """Wraps extract_project with a per-project wall-clock timeout (signal-based, Linux only)."""
+    # signal.alarm only works on the main thread — threads use the no-op path
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(PROJECT_TIMEOUT)
+        try:
+            return extract_project(project, now)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    except (OSError, AttributeError):
+        # signal.SIGALRM not available (Windows / non-main thread) — run without timeout
+        return extract_project(project, now)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BIGQUERY WRITE — replace project data (tasks), append time + actions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,7 +618,7 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
-            executor.submit(extract_project, p, now): (p, label)
+            executor.submit(extract_project_with_timeout, p, now): (p, label)
             for p, label in to_sync
         }
 
