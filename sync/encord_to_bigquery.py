@@ -43,7 +43,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from encord import EncordUserClient, Project
-from encord.orm.analytics import TaskActionType
 from encord.workflow import (
     AnnotationStage,
     ConsensusAnnotationStage,
@@ -385,34 +384,59 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     except Exception as e:
         log.warning("[%s] list_time_spent error: %s", title, e)
 
-    # ── Task actions — approve / reject / submit / assign / etc ──
+    # ── Task actions — approve / reject / submit via get_label_logs (primary)
+    #    Fallback to get_task_actions if get_label_logs unavailable
+    actions_loaded = False
     try:
-        for a in project.get_task_actions(
-            after=since,
-            action_type=[
-                TaskActionType.APPROVE,
-                TaskActionType.REJECT,
-                TaskActionType.SUBMIT,
-                TaskActionType.ASSIGN,
-                TaskActionType.RELEASE,
-                TaskActionType.SKIP,
-                TaskActionType.MOVE,
-            ],
-        ):
+        for a in project.get_label_logs(after=since):
+            action_raw = str(getattr(a, "action", "")).upper()
+            # Only capture task-level actions we care about
+            if not any(kw in action_raw for kw in ("SUBMIT", "APPROVE", "REJECT")):
+                continue
+            # Normalize action type
+            if "REJECT" in action_raw:
+                action_type = "REJECT"
+            elif "APPROVE" in action_raw:
+                action_type = "APPROVE"
+            elif "SUBMIT" in action_raw:
+                action_type = "SUBMIT"
+            else:
+                action_type = action_raw
+
             result["actions"].append({
                 "project_hash":        ph,
                 "client_workspace":    workspace,
                 "project_title":       title,
-                "task_uuid":           str(a.task_uuid),
-                "data_unit_uuid":      str(a.data_unit_uuid) if a.data_unit_uuid else None,
-                "workflow_stage_uuid": str(a.workflow_stage_uuid) if a.workflow_stage_uuid else None,
-                "actor_email":         a.actor_email,
-                "action_type":         str(a.action_type),
-                "event_timestamp":     a.timestamp.isoformat() if a.timestamp else now.isoformat(),
+                "task_uuid":           str(getattr(a, "data_hash", "") or ""),
+                "data_unit_uuid":      str(getattr(a, "data_hash", "") or ""),
+                "workflow_stage_uuid": None,
+                "actor_email":         str(getattr(a, "user_email", "") or ""),
+                "action_type":         action_type,
+                "event_timestamp":     a.created_at.isoformat() if getattr(a, "created_at", None) else now.isoformat(),
                 "ingested_at":         now.isoformat(),
             })
+        actions_loaded = True
     except Exception as e:
-        log.warning("[%s] get_task_actions error: %s", title, e)
+        log.warning("[%s] get_label_logs failed: %s — trying get_task_actions fallback", title, e)
+
+    # Fallback: get_task_actions (newer API, doesn't work on all projects)
+    if not actions_loaded:
+        try:
+            for a in project.get_task_actions(after=since):
+                result["actions"].append({
+                    "project_hash":        ph,
+                    "client_workspace":    workspace,
+                    "project_title":       title,
+                    "task_uuid":           str(a.task_uuid),
+                    "data_unit_uuid":      str(a.data_unit_uuid) if a.data_unit_uuid else None,
+                    "workflow_stage_uuid": str(a.workflow_stage_uuid) if a.workflow_stage_uuid else None,
+                    "actor_email":         a.actor_email,
+                    "action_type":         str(a.action_type),
+                    "event_timestamp":     a.timestamp.isoformat() if a.timestamp else now.isoformat(),
+                    "ingested_at":         now.isoformat(),
+                })
+        except Exception as e:
+            log.warning("[%s] get_task_actions fallback also failed: %s", title, e)
 
     log.info("  ✓ %s — %d tasks | %d time entries | %d actions",
              title, len(result["tasks"]), len(result["time"]), len(result["actions"]))
