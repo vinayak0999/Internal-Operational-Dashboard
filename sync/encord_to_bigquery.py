@@ -389,40 +389,50 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     except Exception as e:
         log.warning("[%s] list_time_spent error: %s", title, e)
 
-    # ── Task actions — approve / reject / submit via get_label_logs (primary)
-    #    Fallback to get_task_actions if get_label_logs unavailable
+    # ── Task actions — approve / reject / submit
+    #    Try: get_editor_logs (current) → get_label_logs (deprecated) → get_task_actions (fallback)
     actions_loaded = False
-    try:
-        for a in project.get_label_logs(after=since):
-            action_raw = str(getattr(a, "action", "")).upper()
-            # Only capture task-level actions we care about
-            if not any(kw in action_raw for kw in ("SUBMIT", "APPROVE", "REJECT")):
-                continue
-            # Normalize action type
-            if "REJECT" in action_raw:
-                action_type = "REJECT"
-            elif "APPROVE" in action_raw:
-                action_type = "APPROVE"
-            elif "SUBMIT" in action_raw:
-                action_type = "SUBMIT"
-            else:
-                action_type = action_raw
 
-            result["actions"].append({
-                "project_hash":        ph,
-                "client_workspace":    workspace,
-                "project_title":       title,
-                "task_uuid":           str(getattr(a, "data_hash", "") or ""),
-                "data_unit_uuid":      str(getattr(a, "data_hash", "") or ""),
-                "workflow_stage_uuid": None,
-                "actor_email":         str(getattr(a, "user_email", "") or ""),
-                "action_type":         action_type,
-                "event_timestamp":     a.created_at.isoformat() if getattr(a, "created_at", None) else now.isoformat(),
-                "ingested_at":         now.isoformat(),
-            })
-        actions_loaded = True
-    except Exception as e:
-        log.warning("[%s] get_label_logs failed: %s — trying get_task_actions fallback", title, e)
+    # Primary: get_editor_logs (replaces deprecated get_label_logs since SDK 0.1.187)
+    for method_name in ("get_editor_logs", "get_label_logs"):
+        if actions_loaded:
+            break
+        method = getattr(project, method_name, None)
+        if method is None:
+            continue
+        try:
+            for a in method(after=since):
+                action_raw = str(getattr(a, "action", "")).upper()
+                # Only capture task-level actions we care about
+                if not any(kw in action_raw for kw in ("SUBMIT", "APPROVE", "REJECT")):
+                    continue
+                # Normalize action type
+                if "REJECT" in action_raw:
+                    action_type = "REJECT"
+                elif "APPROVE" in action_raw:
+                    action_type = "APPROVE"
+                elif "SUBMIT" in action_raw:
+                    action_type = "SUBMIT"
+                else:
+                    action_type = action_raw
+
+                result["actions"].append({
+                    "project_hash":        ph,
+                    "client_workspace":    workspace,
+                    "project_title":       title,
+                    "task_uuid":           str(getattr(a, "data_hash", "") or ""),
+                    "data_unit_uuid":      str(getattr(a, "data_hash", "") or ""),
+                    "workflow_stage_uuid": None,
+                    "actor_email":         str(getattr(a, "user_email", "") or ""),
+                    "action_type":         action_type,
+                    "event_timestamp":     a.created_at.isoformat() if getattr(a, "created_at", None) else now.isoformat(),
+                    "ingested_at":         now.isoformat(),
+                })
+            actions_loaded = True
+            if result["actions"]:
+                log.info("  [%s] %d actions via %s", title, len(result["actions"]), method_name)
+        except Exception as e:
+            log.warning("[%s] %s failed: %s", title, method_name, e)
 
     # Fallback: get_task_actions (newer API, doesn't work on all projects)
     if not actions_loaded:
