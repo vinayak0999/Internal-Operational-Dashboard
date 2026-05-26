@@ -43,6 +43,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from encord import EncordUserClient, Project
+from encord.orm.label_log import Action as LabelAction
 from encord.workflow import (
     AnnotationStage,
     ConsensusAnnotationStage,
@@ -50,6 +51,13 @@ from encord.workflow import (
     FinalStage,
     ReviewStage,
 )
+
+# Action IntEnum → human-readable mapping
+_ACTION_MAP = {
+    LabelAction.SUBMIT_TASK:   "SUBMIT",     # 11
+    LabelAction.APPROVE_TASK:  "APPROVE",    # 33
+    LabelAction.REJECT_TASK:   "REJECT",     # 34
+}
 
 from google.cloud import bigquery
 from google.cloud.bigquery import SchemaField
@@ -161,6 +169,8 @@ SCHEMA_TASKS_SNAPSHOT = [
     SchemaField("task_status",       "STRING"),
     SchemaField("assignee_email",    "STRING"),
     SchemaField("is_complete",       "BOOL"),
+    SchemaField("created_at",        "TIMESTAMP"),
+    SchemaField("updated_at",        "TIMESTAMP"),
     SchemaField("snapshot_at",       "TIMESTAMP", mode="REQUIRED"),
 ]
 
@@ -195,6 +205,37 @@ SCHEMA_TASK_ACTIONS = [
     SchemaField("action_type",          "STRING"),
     SchemaField("event_timestamp",      "TIMESTAMP", mode="REQUIRED"),
     SchemaField("ingested_at",          "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_LABEL_ROWS = [
+    SchemaField("project_hash",      "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",  "STRING"),
+    SchemaField("project_title",     "STRING"),
+    SchemaField("data_hash",         "STRING",    mode="REQUIRED"),
+    SchemaField("data_title",        "STRING"),
+    SchemaField("data_type",         "STRING"),
+    SchemaField("dataset_hash",      "STRING"),
+    SchemaField("dataset_title",     "STRING"),
+    SchemaField("task_uuid",         "STRING"),
+    SchemaField("workflow_node_uuid","STRING"),
+    SchemaField("workflow_node_title","STRING"),
+    SchemaField("duration",          "FLOAT64"),
+    SchemaField("fps",               "FLOAT64"),
+    SchemaField("width",             "INT64"),
+    SchemaField("height",            "INT64"),
+    SchemaField("number_of_frames",  "INT64"),
+    SchemaField("priority",          "FLOAT64"),
+    SchemaField("is_labelling_initialised", "BOOL"),
+    SchemaField("snapshot_at",       "TIMESTAMP", mode="REQUIRED"),
+]
+
+SCHEMA_PROJECT_USERS = [
+    SchemaField("project_hash",      "STRING",    mode="REQUIRED"),
+    SchemaField("client_workspace",  "STRING"),
+    SchemaField("project_title",     "STRING"),
+    SchemaField("user_email",        "STRING",    mode="REQUIRED"),
+    SchemaField("user_role",         "STRING"),
+    SchemaField("ingested_at",       "TIMESTAMP", mode="REQUIRED"),
 ]
 
 # Incremental sync state (tracks last_edited_at per project)
@@ -252,6 +293,11 @@ def setup_tables(bq: bigquery.Client) -> None:
     ensure_table(bq, "task_actions",    SCHEMA_TASK_ACTIONS,
                  partition_field="event_timestamp",
                  cluster_fields=["project_hash", "actor_email", "action_type"])
+    ensure_table(bq, "label_rows",      SCHEMA_LABEL_ROWS,
+                 partition_field="snapshot_at",
+                 cluster_fields=["project_hash", "client_workspace"])
+    ensure_table(bq, "project_users",   SCHEMA_PROJECT_USERS,
+                 cluster_fields=["project_hash"])
     ensure_table(bq, "sync_state",      SCHEMA_SYNC_STATE)
     log.info("All tables ready.")
 
@@ -327,6 +373,8 @@ def extract_project(project: Project, now: dt.datetime, encord_client=None) -> d
         "tasks": [],
         "time": [],
         "actions": [],
+        "label_rows": [],
+        "users": [],
     }
 
     # ── Workflow stages ──
@@ -366,6 +414,8 @@ def extract_project(project: Project, now: dt.datetime, encord_client=None) -> d
                         "task_status":      str(status) if status else None,
                         "assignee_email":   str(assignee) if assignee else None,
                         "is_complete":      is_final,
+                        "created_at":       task.created_at.isoformat() if getattr(task, "created_at", None) else None,
+                        "updated_at":       task.updated_at.isoformat() if getattr(task, "updated_at", None) else None,
                         "snapshot_at":      now.isoformat(),
                     })
                 workflow_ok = True
@@ -422,50 +472,33 @@ def extract_project(project: Project, now: dt.datetime, encord_client=None) -> d
     except Exception as e:
         log.warning("[%s] list_time_spent error: %s", title, e)
 
-    # ── Task actions — approve / reject / submit
-    #    Try: get_editor_logs (current) → get_label_logs (deprecated) → get_task_actions (fallback)
+    # ── Task actions — SUBMIT / APPROVE / REJECT via get_label_logs ──
+    #    Actions are IntEnum: SUBMIT_TASK=11, APPROVE_TASK=33, REJECT_TASK=34
+    #    get_label_logs works (deprecated warning only); get_editor_logs has different params
     actions_loaded = False
-
-    # Primary: get_editor_logs (replaces deprecated get_label_logs since SDK 0.1.187)
-    for method_name in ("get_editor_logs", "get_label_logs"):
-        if actions_loaded:
-            break
-        method = getattr(project, method_name, None)
-        if method is None:
-            continue
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
         try:
-            for a in method(after=since):
-                action_raw = str(getattr(a, "action", "")).upper()
-                # Only capture task-level actions we care about
-                if not any(kw in action_raw for kw in ("SUBMIT", "APPROVE", "REJECT")):
-                    continue
-                # Normalize action type
-                if "REJECT" in action_raw:
-                    action_type = "REJECT"
-                elif "APPROVE" in action_raw:
-                    action_type = "APPROVE"
-                elif "SUBMIT" in action_raw:
-                    action_type = "SUBMIT"
-                else:
-                    action_type = action_raw
-
+            for a in project.get_label_logs(after=since):
+                action_type = _ACTION_MAP.get(a.action)
+                if not action_type:
+                    continue  # skip START, END, CLICK_SAVE, etc.
                 result["actions"].append({
                     "project_hash":        ph,
                     "client_workspace":    workspace,
                     "project_title":       title,
-                    "task_uuid":           str(getattr(a, "data_hash", "") or ""),
-                    "data_unit_uuid":      str(getattr(a, "data_hash", "") or ""),
+                    "task_uuid":           str(a.data_hash),
+                    "data_unit_uuid":      str(a.data_hash),
                     "workflow_stage_uuid": None,
-                    "actor_email":         str(getattr(a, "user_email", "") or ""),
+                    "actor_email":         a.user_email,
                     "action_type":         action_type,
-                    "event_timestamp":     a.created_at.isoformat() if getattr(a, "created_at", None) else now.isoformat(),
+                    "event_timestamp":     a.created_at.isoformat(),
                     "ingested_at":         now.isoformat(),
                 })
             actions_loaded = True
-            if result["actions"]:
-                log.info("  [%s] %d actions via %s", title, len(result["actions"]), method_name)
         except Exception as e:
-            log.warning("[%s] %s failed: %s", title, method_name, e)
+            log.warning("[%s] get_label_logs failed: %s", title, e)
 
     # Fallback: get_task_actions (newer API, doesn't work on all projects)
     if not actions_loaded:
@@ -486,8 +519,55 @@ def extract_project(project: Project, now: dt.datetime, encord_client=None) -> d
         except Exception as e:
             log.warning("[%s] get_task_actions fallback also failed: %s", title, e)
 
-    log.info("  ✓ %s — %d tasks | %d time entries | %d actions",
-             title, len(result["tasks"]), len(result["time"]), len(result["actions"]))
+    # ── Label rows — data unit details (type, duration, resolution, current stage) ──
+    try:
+        for lr in project.list_label_rows_v2():
+            wf_node = getattr(lr, "workflow_graph_node", None)
+            result["label_rows"].append({
+                "project_hash":      ph,
+                "client_workspace":  workspace,
+                "project_title":     title,
+                "data_hash":         str(lr.data_hash),
+                "data_title":        getattr(lr, "data_title", None),
+                "data_type":         str(getattr(lr, "data_type", "")) if getattr(lr, "data_type", None) else None,
+                "dataset_hash":      str(lr.dataset_hash) if getattr(lr, "dataset_hash", None) else None,
+                "dataset_title":     getattr(lr, "dataset_title", None),
+                "task_uuid":         str(lr.task_uuid) if getattr(lr, "task_uuid", None) else None,
+                "workflow_node_uuid": str(wf_node.uuid) if wf_node and getattr(wf_node, "uuid", None) else None,
+                "workflow_node_title": wf_node.title if wf_node and getattr(wf_node, "title", None) else None,
+                "duration":          getattr(lr, "duration", None),
+                "fps":               getattr(lr, "fps", None),
+                "width":             getattr(lr, "width", None),
+                "height":            getattr(lr, "height", None),
+                "number_of_frames":  getattr(lr, "number_of_frames", None),
+                "priority":          getattr(lr, "priority", None),
+                "is_labelling_initialised": getattr(lr, "is_labelling_initialised", None),
+                "snapshot_at":       now.isoformat(),
+            })
+    except Exception as e:
+        log.warning("[%s] list_label_rows_v2 error: %s", title, e)
+
+    # ── Project users — team members with roles ──
+    try:
+        for u in project.list_users():
+            role_val = getattr(u, "user_role", None)
+            # Map role int: 0=ADMIN, 1=ANNOTATOR, 2=REVIEWER, 3=ANNOTATOR_REVIEWER
+            role_names = {0: "ADMIN", 1: "ANNOTATOR", 2: "REVIEWER", 3: "ANNOTATOR_REVIEWER"}
+            role_str = role_names.get(role_val, str(role_val)) if role_val is not None else None
+            result["users"].append({
+                "project_hash":      ph,
+                "client_workspace":  workspace,
+                "project_title":     title,
+                "user_email":        u.user_email,
+                "user_role":         role_str,
+                "ingested_at":       now.isoformat(),
+            })
+    except Exception as e:
+        log.warning("[%s] list_users error: %s", title, e)
+
+    log.info("  ✓ %s — %d tasks | %d time | %d actions | %d label_rows | %d users",
+             title, len(result["tasks"]), len(result["time"]), len(result["actions"]),
+             len(result["label_rows"]), len(result["users"]))
     return result
 
 
@@ -582,6 +662,35 @@ def write_task_actions(bq: bigquery.Client, ph: str, rows: list) -> None:
         errors = bq.insert_rows_json(table, rows[i:i+1000])
         if errors:
             log.error("task_actions write error (batch %d): %s", i // 1000, errors)
+
+
+def write_label_rows(bq: bigquery.Client, ph: str, rows: list) -> None:
+    """Replace today's label rows snapshot for this project."""
+    if not rows:
+        return
+    today = dt.date.today().isoformat()
+    bq.query(f"""
+        DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.label_rows`
+        WHERE project_hash = '{ph}'
+        AND DATE(snapshot_at) = '{today}'
+    """).result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.label_rows")
+    for i in range(0, len(rows), 1000):
+        errors = bq.insert_rows_json(table, rows[i:i+1000])
+        if errors:
+            log.error("label_rows write error (batch %d): %s", i // 1000, errors)
+
+
+def write_project_users(bq: bigquery.Client, ph: str, rows: list) -> None:
+    """Replace project users for this project."""
+    if not rows:
+        return
+    bq.query(f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.project_users` WHERE project_hash = '{ph}'").result()
+    table = bq.get_table(f"{GCP_PROJECT}.{BQ_DATASET}.project_users")
+    for i in range(0, len(rows), 1000):
+        errors = bq.insert_rows_json(table, rows[i:i+1000])
+        if errors:
+            log.error("project_users write error (batch %d): %s", i // 1000, errors)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,6 +863,8 @@ def main() -> None:
                 write_task_snapshot(bq, ph, data["tasks"])
                 write_time_spent(bq, ph, data["time"])
                 write_task_actions(bq, ph, data["actions"])
+                write_label_rows(bq, ph, data["label_rows"])
+                write_project_users(bq, ph, data["users"])
 
                 # Record new sync state
                 new_sync_state.append({
