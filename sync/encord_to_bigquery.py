@@ -620,15 +620,32 @@ def main() -> None:
     # ── Filter by client (if CLIENT_FILTER is set) ──
     if CLIENT_FILTER:
         log.info("CLIENT_FILTER active: %s", CLIENT_FILTER)
-        filtered = []
-        client_skipped = 0
+
+        # Build workspace map: {workspace_name_lower: [(project, label), ...]}
+        workspace_map: dict[str, list] = {}
         for p, label in unique_projects:
-            workspace = derive_client_workspace(getattr(p, "creator_email", None)).lower()
-            if workspace in CLIENT_FILTER:
-                filtered.append((p, label))
-            else:
-                client_skipped += 1
-        log.info("Client filter: %d matched, %d skipped", len(filtered), client_skipped)
+            ws = derive_client_workspace(getattr(p, "creator_email", None))
+            workspace_map.setdefault(ws.lower(), []).append((p, label))
+
+        # Log all unique workspaces for debugging
+        all_workspaces = sorted(workspace_map.keys())
+        log.info("Available workspaces (%d unique): %s",
+                 len(all_workspaces), ", ".join(all_workspaces[:100]))
+
+        # Fuzzy match: filter term in workspace OR workspace in filter term
+        filtered = []
+        matched_workspaces = set()
+        for ws_lower, projects_list in workspace_map.items():
+            for f in CLIENT_FILTER:
+                if f in ws_lower or ws_lower in f or ws_lower.replace(" ", "") == f.replace(" ", ""):
+                    filtered.extend(projects_list)
+                    matched_workspaces.add(ws_lower)
+                    break
+
+        log.info("Client filter: %d projects matched (%d workspaces: %s), %d skipped",
+                 len(filtered), len(matched_workspaces),
+                 ", ".join(sorted(matched_workspaces)),
+                 len(unique_projects) - len(filtered))
         unique_projects = filtered
 
     # ── Determine which need syncing ──
