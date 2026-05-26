@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 6 * * *"        # Daily at 06:00 UTC
   workflow_dispatch:            # Manual trigger from Actions tab
+    inputs:
+      client_filter:
+        description: 'Comma-separated client names to sync (empty = ALL)'
+        required: false
+        default: ''
 
 jobs:
   sync:
@@ -42,4 +47,5 @@ jobs:
           ENCORD_DOMAIN: https://api.encord.com
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
           BQ_DATASET: ${{ secrets.BQ_DATASET }}
+          CLIENT_FILTER: ${{ github.event.inputs.client_filter }}
         run: python Internal-Operational-Dashboard/sync/encord_to_bigquery.py

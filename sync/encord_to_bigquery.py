@@ -86,6 +86,11 @@ MAX_WORKERS      = int(os.environ.get("MAX_WORKERS", "5"))
 PROJECT_TIMEOUT  = int(os.environ.get("PROJECT_TIMEOUT_SEC", "120"))  # per-project SDK timeout
 BACKFILL_FROM    = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)  # floor for history
 
+# Optional: filter to specific clients only (comma-separated, case-insensitive)
+# e.g. "1X,ACME Co.,Aigen" — if empty, processes ALL clients
+_raw_filter = os.environ.get("CLIENT_FILTER", "").strip()
+CLIENT_FILTER = {c.strip().lower() for c in _raw_filter.split(",") if c.strip()} if _raw_filter else set()
+
 
 class ProjectTimeoutError(Exception):
     pass
@@ -611,6 +616,20 @@ def main() -> None:
             unique_projects.append((p, label))
 
     log.info("Total unique projects: %d", len(unique_projects))
+
+    # ── Filter by client (if CLIENT_FILTER is set) ──
+    if CLIENT_FILTER:
+        log.info("CLIENT_FILTER active: %s", CLIENT_FILTER)
+        filtered = []
+        client_skipped = 0
+        for p, label in unique_projects:
+            workspace = derive_client_workspace(getattr(p, "creator_email", None)).lower()
+            if workspace in CLIENT_FILTER:
+                filtered.append((p, label))
+            else:
+                client_skipped += 1
+        log.info("Client filter: %d matched, %d skipped", len(filtered), client_skipped)
+        unique_projects = filtered
 
     # ── Determine which need syncing ──
     to_sync = []    # list of (project, endpoint_label)
