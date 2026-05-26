@@ -303,7 +303,7 @@ def save_sync_state(bq: bigquery.Client, rows: list[dict]) -> None:
 # EXTRACTION — one project at a time (runs in thread pool)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_project(project: Project, now: dt.datetime) -> dict:
+def extract_project(project: Project, now: dt.datetime, encord_client=None) -> dict:
     """Extract all data for a single project. Returns dict of row lists."""
     ph = str(project.project_hash)
     workspace = derive_client_workspace(getattr(project, "creator_email", None))
@@ -311,6 +311,13 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     since = getattr(project, "created_at", BACKFILL_FROM) or BACKFILL_FROM
     if since.tzinfo is None:
         since = since.replace(tzinfo=dt.timezone.utc)
+
+    # Re-initialize project with full auth context (list_projects stubs may lack permissions)
+    if encord_client:
+        try:
+            project = encord_client.get_project(ph)
+        except Exception as e:
+            log.debug("[%s] get_project re-init failed (using stub): %s", title, e)
 
     result = {
         "project_hash": ph,
@@ -323,6 +330,7 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     }
 
     # ── Workflow stages ──
+    workflow_ok = False
     wf = getattr(project, "workflow", None)
     if wf:
         for stage in wf.stages:
@@ -360,8 +368,33 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
                         "is_complete":      is_final,
                         "snapshot_at":      now.isoformat(),
                     })
+                workflow_ok = True
             except Exception as e:
                 log.warning("[%s] tasks error @ %s: %s", title, stage.title, e)
+
+    # ── Fallback: list_label_rows_v2 if workflow stages had permission errors ──
+    if not result["tasks"] and not workflow_ok:
+        try:
+            for lr in project.list_label_rows_v2():
+                result["tasks"].append({
+                    "project_hash":     ph,
+                    "client_workspace": workspace,
+                    "project_title":    title,
+                    "task_uuid":        str(lr.data_hash),
+                    "data_hash":        str(lr.data_hash),
+                    "data_title":       getattr(lr, "data_title", None),
+                    "stage_uuid":       None,
+                    "stage_title":      None,
+                    "stage_type":       None,
+                    "task_status":      str(getattr(lr, "label_hash", None) or "NOT_LABELLED"),
+                    "assignee_email":   getattr(lr, "annotation_task_status", None),
+                    "is_complete":      str(getattr(lr, "annotation_task_status", "")).upper() == "COMPLETED",
+                    "snapshot_at":      now.isoformat(),
+                })
+            if result["tasks"]:
+                log.info("  [%s] %d tasks via list_label_rows_v2 fallback", title, len(result["tasks"]))
+        except Exception as e:
+            log.warning("[%s] list_label_rows_v2 fallback also failed: %s", title, e)
 
     # ── Time spent (full history from project start) ──
     try:
@@ -458,20 +491,20 @@ def extract_project(project: Project, now: dt.datetime) -> dict:
     return result
 
 
-def extract_project_with_timeout(project: Project, now: dt.datetime) -> dict:
+def extract_project_with_timeout(project: Project, now: dt.datetime, encord_client=None) -> dict:
     """Wraps extract_project with a per-project wall-clock timeout (signal-based, Linux only)."""
     # signal.alarm only works on the main thread — threads use the no-op path
     try:
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(PROJECT_TIMEOUT)
         try:
-            return extract_project(project, now)
+            return extract_project(project, now, encord_client=encord_client)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
     except (OSError, AttributeError):
         # signal.SIGALRM not available (Windows / non-main thread) — run without timeout
-        return extract_project(project, now)
+        return extract_project(project, now, encord_client=encord_client)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -686,9 +719,13 @@ def main() -> None:
     failed = 0
     new_sync_state = []
 
+    # Build a client lookup: endpoint_label -> encord_client
+    client_lookup = {label: c for c, label in clients}
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {
-            executor.submit(extract_project_with_timeout, p, now): (p, label)
+            executor.submit(extract_project_with_timeout, p, now,
+                            encord_client=client_lookup.get(label)): (p, label)
             for p, label in to_sync
         }
 
